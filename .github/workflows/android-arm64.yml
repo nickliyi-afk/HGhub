@@ -1,0 +1,103 @@
+
+name: Build Android ARM64 APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" --install 'platform-tools' 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: android-arm64
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Initialize Android project
+        run: pnpm tauri android init --ci
+
+      - name: Build ARM64 APK
+        run: pnpm tauri android build --apk --split-per-abi --target aarch64
+
+      - name: Sign APK with test key
+        shell: bash
+        run: |
+          set -euo pipefail
+          keytool -genkeypair \
+            -keystore "$RUNNER_TEMP/test.jks" \
+            -storepass android \
+            -keypass android \
+            -alias test \
+            -keyalg RSA \
+            -keysize 3072 \
+            -validity 3650 \
+            -dname 'CN=Local Test Build' \
+            -noprompt
+
+          mkdir -p artifacts
+
+          mapfile -d '' files < <(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*release*.apk' -print0)
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No release APK found"
+            exit 1
+          fi
+
+          signer="$ANDROID_SDK_ROOT/build-tools/36.0.0/apksigner"
+
+          for i in "${!files[@]}"; do
+            "$signer" sign \
+              --ks "$RUNNER_TEMP/test.jks" \
+              --ks-key-alias test \
+              --ks-pass pass:android \
+              --key-pass pass:android \
+              --v4-signing-enabled false \
+              --out "artifacts/HGhub_arm64_test_${i}.apk" \
+              "${files[$i]}"
+
+            "$signer" verify --print-certs "artifacts/HGhub_arm64_test_${i}.apk"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-Android-ARM64
+          path: artifacts/*.apk
+          if-no-files-found: error
